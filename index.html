@@ -625,6 +625,7 @@
       const sheenTexture = makeSheenTexture();
       for (let i = 0; i < 10; i++) cards.push(makeCard(ITEMS[i % 5], i, labelTextures[i % 5], sheenTexture));
       cardGroups = cards.map(card => card.group);
+      window.__DEBUG = { get cards() { return cards; }, get intro() { return intro; }, get pos() { return pos; }, get scene() { return scene; }, get camera() { return camera; } };
     }
 
     function resizeModel() {
