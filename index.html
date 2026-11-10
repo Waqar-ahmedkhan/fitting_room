@@ -289,7 +289,7 @@
     </div>
     <div class="buy-options">
       <div class="size-group">
-        <div class="option-label">Size</div>
+        <div class="option-label" id="sizeLabel">Size · M · Regular</div>
         <div class="sizes" id="sizes">
           <button class="size-chip" data-size="S" aria-pressed="false">S</button>
           <button class="size-chip active" data-size="M" aria-pressed="true">M</button>
@@ -351,6 +351,7 @@
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     const ghostLetters = [...ghostEl.children];
     const sizeButtons = [...document.querySelectorAll('.size-chip')];
+    const sizeLabel = document.getElementById('sizeLabel');
     const tabButtons = [...document.querySelectorAll('.tab')];
     const railButtons = [...document.querySelectorAll('.rail-btn')];
     const tabsNav = document.querySelector('.tabs');
@@ -369,8 +370,17 @@
     let raycaster = null, ndc = null;
     let pointerDirty = false, lastHoverAt = 0, cursorMode = '', loopRunning = false;
     let lastFrame = 0, parallaxX = NaN, parallaxY = NaN, parallaxIntro = -1;
-    let tintCurrent = null, tintTarget = null;
-    const MASK_SCALE = .5, MASK_MIN_COMPONENT = .015, MASK_GROW_STEPS = 8, MASK_WEAK_SATURATION = .2, MASK_WEAK_LUMA = .06;
+    let tintCurrent = null, tintTarget = null, fitCurrent = null, fitTarget = null;
+    const MASK_SCALE = .5, MASK_MIN_COMPONENT = .015, MASK_GROW_STEPS = 16, MASK_WEAK_SATURATION = .2, MASK_WEAK_LUMA = .06;
+    const MASK_TRIM_LUMA = .22, MASK_TRIM_SATURATION = .35, MASK_TRIM_ROWS = .7, MASK_SOLID_ALPHA = 245, MASK_MIN_RUN = 12, MASK_SOFTEN = 2;
+    const MODEL_PAD = .2, FIT_ANCHOR = [.5, .8], FIT_BAND = .1;
+    const MODEL_ASPECT = (1 + 2 * MODEL_PAD) * 524 / 1360;
+    const SIZES = {
+      S: { fit: [1, 1], label: 'Slim' },
+      M: { fit: [1.04, 1.025], label: 'Regular' },
+      L: { fit: [1.09, 1.05], label: 'Relaxed' },
+      XL: { fit: [1.14, 1.08], label: 'Loose' }
+    };
     const mod = (n, m) => ((n % m) + m) % m;
     const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
@@ -402,6 +412,12 @@
       return c;
     }
 
+    function padCanvas(source, padX) {
+      const c = document.createElement('canvas'); c.width = source.width + padX * 2; c.height = source.height;
+      c.getContext('2d').drawImage(source, padX, 0);
+      return c;
+    }
+
     function textureFromCanvas(c) {
       const texture = new THREE.CanvasTexture(c);
       texture.colorSpace = THREE.SRGBColorSpace;
@@ -410,6 +426,23 @@
       texture.minFilter = THREE.LinearMipmapLinearFilter;
       texture.magFilter = THREE.LinearFilter;
       return texture;
+    }
+
+    function boxBlur(values, width, height, radius) {
+      const span = radius * 2 + 1;
+      const pass = (source, lines, length, indexOf) => {
+        const result = new Float32Array(source.length);
+        for (let line = 0; line < lines; line++) {
+          for (let k = 0; k < length; k++) {
+            let sum = 0;
+            for (let d = -radius; d <= radius; d++) sum += source[indexOf(line, clamp(k + d, 0, length - 1))];
+            result[indexOf(line, k)] = sum / span;
+          }
+        }
+        return result;
+      };
+      const horizontal = pass(values, height, width, (line, k) => line * width + k);
+      return pass(horizontal, width, height, (line, k) => k * width + line);
     }
 
     const srgbToLinear = Array.from({ length: 256 }, (_, i) => {
@@ -431,7 +464,7 @@
       const lMin = Math.max(.3, baseL * .58);
       const sMax = baseL > .8 ? .16 : .14;
       const y0 = Math.floor(height * .16), y1 = Math.floor(height * .8);
-      const cond = new Uint8Array(total), weak = new Uint8Array(total), mask = new Uint8Array(total);
+      const cond = new Uint8Array(total), weak = new Uint8Array(total), trim = new Uint8Array(total), mask = new Uint8Array(total);
 
       for (let y = y0; y < y1; y++) {
         for (let x = 0; x < width; x++) {
@@ -441,7 +474,9 @@
           const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
           const saturation = mx > 1e-4 ? (mx - mn) / mx : 1, luma = .299 * r + .587 * g + .114 * b;
           cond[i] = saturation < sMax && luma > lMin ? 1 : 0;
+          if (data[p + 3] < MASK_SOLID_ALPHA) continue;
           weak[i] = saturation < MASK_WEAK_SATURATION && luma > MASK_WEAK_LUMA ? 1 : 0;
+          trim[i] = saturation < MASK_TRIM_SATURATION && luma < MASK_TRIM_LUMA ? 1 : 0;
         }
       }
 
@@ -475,12 +510,28 @@
         lumaSum += .299 * srgbToLinear[data[p]] + .587 * srgbToLinear[data[p + 1]] + .114 * srgbToLinear[data[p + 2]];
       }));
 
+      for (let y = minRow; y <= maxRow; y++) {
+        let runStart = -1;
+        for (let x = 0; x <= width; x++) {
+          const on = x < width && mask[y * width + x];
+          if (on && runStart < 0) runStart = x;
+          if (!on && runStart >= 0) {
+            if (x - runStart < MASK_MIN_RUN) mask.fill(0, y * width + runStart, y * width + x);
+            runStart = -1;
+          }
+        }
+      }
+
+      const trimRowLimit = minRow + Math.round((maxRow - minRow) * MASK_TRIM_ROWS);
+
       for (let step = 0; step < MASK_GROW_STEPS; step++) {
         const grown = mask.slice();
         for (let y = minRow; y <= maxRow; y++) {
           for (let x = 1; x < width - 1; x++) {
             const i = y * width + x;
-            if (!mask[i] && weak[i] && (mask[i - 1] || mask[i + 1] || mask[i + width])) grown[i] = 1;
+            const touchesMask = mask[i - 1] || mask[i + 1] || mask[i + width];
+            const trimAllowed = trim[i] && y < trimRowLimit;
+            if (!mask[i] && ((weak[i] && touchesMask) || (trimAllowed && (touchesMask || mask[i - width])))) grown[i] = 1;
           }
         }
         mask.set(grown);
@@ -489,7 +540,10 @@
       const maskCanvas = document.createElement('canvas'); maskCanvas.width = width; maskCanvas.height = height;
       const maskCtx = maskCanvas.getContext('2d');
       const img = maskCtx.createImageData(width, height);
-      mask.forEach((on, i) => { if (on) img.data.fill(255, i << 2, (i << 2) + 4); });
+      boxBlur(mask, width, height, MASK_SOFTEN).forEach((value, i) => {
+        const p = i << 2, level = Math.round(value * 255);
+        img.data[p] = level; img.data[p + 1] = level; img.data[p + 2] = level; img.data[p + 3] = 255;
+      });
       maskCtx.putImageData(img, 0, 0);
 
       const texture = new THREE.CanvasTexture(maskCanvas);
@@ -573,7 +627,9 @@
         uMask: { value: modelMasks[index] },
         uTint: { value: new THREE.Color(ITEMS[index].c[0][1]) },
         uBaseLuma: { value: modelLumas[index] },
-        uReveal: { value: 0 }
+        uReveal: { value: 0 },
+        uFit: { value: new THREE.Vector2(...SIZES[selectedSize].fit) },
+        uAnchor: { value: new THREE.Vector2(...FIT_ANCHOR) }
       };
       const material = new THREE.MeshBasicMaterial({
         map: modelTextures[index], transparent: true, depthWrite: false, toneMapped: false,
@@ -586,14 +642,31 @@
         shader.uniforms.uTint = uniforms.uTint;
         shader.uniforms.uBaseLuma = uniforms.uBaseLuma;
         shader.uniforms.uReveal = uniforms.uReveal;
+        shader.uniforms.uFit = uniforms.uFit;
+        shader.uniforms.uAnchor = uniforms.uAnchor;
         const discardCondition = reveal ? 'vMapUv.y < (1.0 - uReveal)' : 'vMapUv.y >= (1.0 - uReveal)';
         shader.fragmentShader = shader.fragmentShader
-          .replace('#include <common>', '#include <common>\nuniform sampler2D uMask;\nuniform vec3 uTint;\nuniform float uBaseLuma;\nuniform float uReveal;')
+          .replace('#include <common>', '#include <common>\nuniform sampler2D uMask;\nuniform vec3 uTint;\nuniform float uBaseLuma;\nuniform float uReveal;\nuniform vec2 uFit;\nuniform vec2 uAnchor;')
+          .replace('#include <map_pars_fragment>', `#include <map_pars_fragment>
+            vec3 garmentTint(vec3 rgb, float mask) {
+              float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
+              float shade = clamp(luma / uBaseLuma, 0.0, 1.0 / max(max(uTint.r, max(uTint.g, uTint.b)), 0.05));
+              return mix(rgb, uTint * shade, mask);
+            }
+            float garmentCoverage(vec2 uv) {
+              return smoothstep(0.18, 0.62, texture2D(uMask, uv).r);
+            }`)
           .replace('#include <map_fragment>', `#include <map_fragment>
-            float garmentMask = smoothstep(0.18, 0.62, texture2D(uMask, vMapUv).r);
-            float garmentLuma = dot(diffuseColor.rgb, vec3(0.299, 0.587, 0.114));
-            float garmentShade = clamp(garmentLuma / uBaseLuma, 0.0, 1.0 / max(max(uTint.r, max(uTint.g, uTint.b)), 0.05));
-            diffuseColor.rgb = mix(diffuseColor.rgb, uTint * garmentShade, garmentMask);`)
+            diffuseColor.rgb = garmentTint(diffuseColor.rgb, garmentCoverage(vMapUv));
+            vec2 fitScale = mix(vec2(1.0), uFit, smoothstep(uAnchor.y, uAnchor.y - ${FIT_BAND.toFixed(3)}, vMapUv.y));
+            vec2 fitUv = uAnchor + (vMapUv - uAnchor) / fitScale;
+            vec4 fitSample = texture2D(map, fitUv);
+            float fitInside = step(0.0, fitUv.x) * step(fitUv.x, 1.0) * step(0.0, fitUv.y) * step(fitUv.y, 1.0);
+            float fitShape = garmentCoverage(fitUv) * fitSample.a * fitInside * opacity;
+            float baseAlpha = diffuseColor.a;
+            float fitAlpha = fitShape + baseAlpha * (1.0 - fitShape);
+            diffuseColor.rgb = (garmentTint(fitSample.rgb, 1.0) * fitShape + diffuseColor.rgb * baseAlpha * (1.0 - fitShape)) / max(fitAlpha, 0.0001);
+            diffuseColor.a = fitAlpha;`)
           .replace('void main() {', `void main() {\n  if (${discardCondition}) discard;`);
       };
       return material;
@@ -607,7 +680,7 @@
 
     function buildModel() {
       const modelH = 1;
-      const geometry = new THREE.PlaneGeometry(524 / 1360 * modelH, modelH);
+      const geometry = new THREE.PlaneGeometry(MODEL_ASPECT * modelH, modelH);
       modelMesh = new THREE.Mesh(geometry, makeModelMaterial(0, false));
       modelMesh.position.z = .5; modelMesh.visible = true; scene.add(modelMesh);
 
@@ -660,7 +733,7 @@
       const modelPx = Math.min(window.innerHeight * (mobile ? .62 : .78), window.innerWidth * (mobile ? 1.28 : .62));
       const worldPerPx = viewHeight / window.innerHeight;
       const h = modelPx * worldPerPx;
-      const w = h * (524 / 1360);
+      const w = h * MODEL_ASPECT;
       const bottom = -viewHeight / 2;
       const y = bottom + h / 2 + (mobile ? -.04 : 0);
       [modelMesh, nextModelMesh, gridMesh].forEach(mesh => {
@@ -776,12 +849,23 @@
       buyPriceEl.textContent = '$' + item.p;
       thumbEl.style.backgroundImage = `url("${ASSETS.garments}")`;
       thumbEl.style.backgroundPosition = `${item.g[0]}% ${item.g[1]}%`;
+      renderSize();
+      renderColors(item);
+    }
+
+    function renderSize() {
       sizeButtons.forEach(btn => {
         const active = btn.dataset.size === selectedSize;
         btn.classList.toggle('active', active);
         btn.setAttribute('aria-pressed', String(active));
       });
-      renderColors(item);
+      sizeLabel.textContent = `Size · ${selectedSize} · ${SIZES[selectedSize].label}`;
+    }
+
+    function updateFit(dt) {
+      if (!fitCurrent || !modelMesh) return;
+      fitCurrent.lerp(fitTarget, 1 - Math.exp(-dt * 9));
+      [modelMesh, nextModelMesh].forEach(mesh => mesh.material.userData.uniforms.uFit.value.copy(fitCurrent));
     }
 
     function setTint(hex) {
@@ -971,7 +1055,7 @@
         lastHoverAt = now; pointerDirty = false;
         updateHover();
       }
-      updateCards(t); updateParallax(dt); updateScan(now); updateTint(dt); maybeSettle();
+      updateCards(t); updateParallax(dt); updateScan(now); updateTint(dt); updateFit(dt); maybeSettle();
       renderer.render(scene, camera);
     }
 
@@ -998,6 +1082,8 @@
       garmentImage = gImg; modelImage = mImg;
       tintCurrent = new THREE.Color(ITEMS[0].c[0][1]);
       tintTarget = tintCurrent.clone();
+      fitCurrent = new THREE.Vector2(...SIZES[selectedSize].fit);
+      fitTarget = fitCurrent.clone();
       initRenderer();
 
       const garmentScale = garmentImage.width / 2048;
@@ -1011,7 +1097,7 @@
         const sy = (garmentImage.height - cropW) * item.g[1] / 100;
         garmentTextures.push(textureFromCanvas(cropCanvas(garmentImage, sx, sy, cropW, cropW)));
         const mx = (modelImage.width - modelW) * item.m / 100;
-        const modelCanvas = cropCanvas(modelImage, mx, modelImage.height - modelH, modelW, modelH, modelW, modelH, true);
+        const modelCanvas = padCanvas(cropCanvas(modelImage, mx, modelImage.height - modelH, modelW, modelH), Math.round(modelW * MODEL_PAD));
         const mask = buildMaskTexture(modelCanvas, item);
         modelTextures.push(textureFromCanvas(modelCanvas));
         modelMasks.push(mask.texture);
@@ -1067,11 +1153,8 @@
     nextBtn.addEventListener('click', () => step(1));
     sizeButtons.forEach(btn => btn.addEventListener('click', () => {
       selectedSize = btn.dataset.size;
-      sizeButtons.forEach(b => {
-        const active = b === btn;
-        b.classList.toggle('active', active);
-        b.setAttribute('aria-pressed', String(active));
-      });
+      if (fitTarget) fitTarget.set(...SIZES[selectedSize].fit);
+      renderSize();
     }));
 
     const addToBagLabel = addToBagBtn.textContent;
