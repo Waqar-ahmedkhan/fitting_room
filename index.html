@@ -325,7 +325,7 @@
       `https://images.higgs.ai/?default=1&output=webp&url=${encodeURIComponent(SOURCE[name])}&w=${width}&q=${quality}`;
     const ASSETS = {
       garments: imgUrl('garments', mobile ? 1400 : 2048, mobile ? 80 : 85),
-      model: imgUrl('model', mobile ? 1200 : 2688, mobile ? 80 : 85)
+      model: imgUrl('model', mobile ? 2048 : 2688, 95)
     };
 
     const ITEMS = [
@@ -360,7 +360,7 @@
     const nextBtn = document.getElementById('next');
 
     let renderer, scene, camera, modelMesh, nextModelMesh, scanMesh, gridMesh;
-    let garmentImage, modelImage, garmentTextures = [], modelTextures = [], modelMasks = [], cards = [], cardGroups = [];
+    let garmentImage, modelImage, garmentTextures = [], modelTextures = [], modelMasks = [], modelLumas = [], cards = [], cardGroups = [];
     let pos = 0, target = 0, intro = reducedMotion ? 1 : 0;
     let selectedIndex = -1, selectedColor = 0, selectedSize = 'M';
     let pointer = { x: 0, y: 0, sx: 0, sy: 0, tx: 0, ty: 0 };
@@ -370,6 +370,7 @@
     let pointerDirty = false, lastHoverAt = 0, cursorMode = '', loopRunning = false;
     let lastFrame = 0, parallaxX = NaN, parallaxY = NaN, parallaxIntro = -1;
     let tintCurrent = null, tintTarget = null;
+    const MASK_SCALE = .5, MASK_MIN_COMPONENT = .015, MASK_GROW_STEPS = 8, MASK_WEAK_SATURATION = .2, MASK_WEAK_LUMA = .06;
     const mod = (n, m) => ((n % m) + m) % m;
     const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
@@ -392,11 +393,12 @@
       return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255];
     };
 
-    function cropCanvas(image, sx, sy, sw, sh, out = 512, readable = false) {
-      const c = document.createElement('canvas'); c.width = out; c.height = out;
+    function cropCanvas(image, sx, sy, sw, sh, outW = sw, outH = sh, readable = false) {
+      const c = document.createElement('canvas'); c.width = outW; c.height = outH;
       const ctx = c.getContext('2d', readable ? { willReadFrequently: true } : undefined);
-      ctx.clearRect(0, 0, out, out);
-      ctx.drawImage(image, sx, sy, sw, sh, 0, 0, out, out);
+      ctx.imageSmoothingQuality = 'high';
+      ctx.clearRect(0, 0, outW, outH);
+      ctx.drawImage(image, Math.round(sx), Math.round(sy), sw, sh, 0, 0, outW, outH);
       return c;
     }
 
@@ -410,36 +412,42 @@
       return texture;
     }
 
+    const srgbToLinear = Array.from({ length: 256 }, (_, i) => {
+      const v = i / 255;
+      return v <= .04045 ? v / 12.92 : Math.pow((v + .055) / 1.055, 2.4);
+    });
+
     // Builds a garment-only mask from the model crop so recolouring never touches skin, hair or trousers.
     function buildMaskTexture(source, item) {
-      const size = 256;
-      const c = document.createElement('canvas'); c.width = size; c.height = size;
+      const width = Math.round(source.width * MASK_SCALE), height = Math.round(source.height * MASK_SCALE);
+      const c = document.createElement('canvas'); c.width = width; c.height = height;
       const ctx = c.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(source, 0, 0, size, size);
-      const data = ctx.getImageData(0, 0, size, size).data;
-      const total = size * size;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(source, 0, 0, width, height);
+      const data = ctx.getImageData(0, 0, width, height).data;
+      const total = width * height;
       const [br, bg, bb] = hexToRgb(item.c[0][1]);
       const baseL = .299 * br + .587 * bg + .114 * bb;
       const lMin = Math.max(.3, baseL * .58);
       const sMax = baseL > .8 ? .16 : .14;
-      const y0 = Math.floor(size * .16), y1 = Math.floor(size * .8);
-      const x0 = Math.floor(size * .03), x1 = Math.floor(size * .97);
-      const cond = new Uint8Array(total);
+      const y0 = Math.floor(height * .16), y1 = Math.floor(height * .8);
+      const cond = new Uint8Array(total), weak = new Uint8Array(total), mask = new Uint8Array(total);
 
       for (let y = y0; y < y1; y++) {
-        for (let x = x0; x < x1; x++) {
-          const i = y * size + x, p = i << 2;
+        for (let x = 0; x < width; x++) {
+          const i = y * width + x, p = i << 2;
           if (data[p + 3] < 128) continue;
           const r = data[p] / 255, g = data[p + 1] / 255, b = data[p + 2] / 255;
           const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-          if (mx > 1e-4 && (mx - mn) / mx < sMax && .299 * r + .587 * g + .114 * b > lMin) cond[i] = 1;
+          const saturation = mx > 1e-4 ? (mx - mn) / mx : 1, luma = .299 * r + .587 * g + .114 * b;
+          cond[i] = saturation < sMax && luma > lMin ? 1 : 0;
+          weak[i] = saturation < MASK_WEAK_SATURATION && luma > MASK_WEAK_LUMA ? 1 : 0;
         }
       }
 
       const visited = new Uint8Array(total);
       const queue = new Int32Array(total);
-      const bestPixels = new Int32Array(total);
-      let bestLen = 0;
+      const components = [];
 
       for (let start = 0; start < total; start++) {
         if (!cond[start] || visited[start]) continue;
@@ -447,22 +455,41 @@
         queue[tail++] = start; visited[start] = 1;
         while (head < tail) {
           const i = queue[head++];
-          const y = (i / size) | 0, x = i - y * size;
+          const y = (i / width) | 0, x = i - y * width;
           if (x > 0 && cond[i - 1] && !visited[i - 1]) { visited[i - 1] = 1; queue[tail++] = i - 1; }
-          if (x < size - 1 && cond[i + 1] && !visited[i + 1]) { visited[i + 1] = 1; queue[tail++] = i + 1; }
-          if (y > 0 && cond[i - size] && !visited[i - size]) { visited[i - size] = 1; queue[tail++] = i - size; }
-          if (y < size - 1 && cond[i + size] && !visited[i + size]) { visited[i + size] = 1; queue[tail++] = i + size; }
+          if (x < width - 1 && cond[i + 1] && !visited[i + 1]) { visited[i + 1] = 1; queue[tail++] = i + 1; }
+          if (y > 0 && cond[i - width] && !visited[i - width]) { visited[i - width] = 1; queue[tail++] = i - width; }
+          if (y < height - 1 && cond[i + width] && !visited[i + width]) { visited[i + width] = 1; queue[tail++] = i + width; }
         }
-        if (tail > bestLen) { bestLen = tail; bestPixels.set(queue.subarray(0, tail)); }
+        components.push(queue.slice(0, tail));
       }
 
-      const maskCanvas = document.createElement('canvas'); maskCanvas.width = size; maskCanvas.height = size;
-      const maskCtx = maskCanvas.getContext('2d');
-      const img = maskCtx.createImageData(size, size);
-      for (let k = 0; k < bestLen; k++) {
-        const p = bestPixels[k] << 2;
-        img.data[p] = 255; img.data[p + 1] = 255; img.data[p + 2] = 255; img.data[p + 3] = 255;
+      const largest = components.reduce((max, pixels) => Math.max(max, pixels.length), 0);
+      const kept = components.filter(pixels => pixels.length >= largest * MASK_MIN_COMPONENT);
+      const maskedCount = kept.reduce((sum, pixels) => sum + pixels.length, 0);
+      let lumaSum = 0, minRow = height, maxRow = 0;
+      kept.forEach(pixels => pixels.forEach(i => {
+        const p = i << 2, row = (i / width) | 0;
+        mask[i] = 1;
+        minRow = Math.min(minRow, row); maxRow = Math.max(maxRow, row);
+        lumaSum += .299 * srgbToLinear[data[p]] + .587 * srgbToLinear[data[p + 1]] + .114 * srgbToLinear[data[p + 2]];
+      }));
+
+      for (let step = 0; step < MASK_GROW_STEPS; step++) {
+        const grown = mask.slice();
+        for (let y = minRow; y <= maxRow; y++) {
+          for (let x = 1; x < width - 1; x++) {
+            const i = y * width + x;
+            if (!mask[i] && weak[i] && (mask[i - 1] || mask[i + 1] || mask[i + width])) grown[i] = 1;
+          }
+        }
+        mask.set(grown);
       }
+
+      const maskCanvas = document.createElement('canvas'); maskCanvas.width = width; maskCanvas.height = height;
+      const maskCtx = maskCanvas.getContext('2d');
+      const img = maskCtx.createImageData(width, height);
+      mask.forEach((on, i) => { if (on) img.data.fill(255, i << 2, (i << 2) + 4); });
       maskCtx.putImageData(img, 0, 0);
 
       const texture = new THREE.CanvasTexture(maskCanvas);
@@ -470,7 +497,7 @@
       texture.minFilter = THREE.LinearFilter;
       texture.magFilter = THREE.LinearFilter;
       texture.generateMipmaps = false;
-      return texture;
+      return { texture, meanLuma: maskedCount ? lumaSum / maskedCount : .5 };
     }
 
     function makeTextTexture(title, price) {
@@ -522,7 +549,7 @@
       const t = new THREE.CanvasTexture(c); t.wrapS = THREE.RepeatWrapping; t.wrapT = THREE.RepeatWrapping; t.repeat.set(1, 18); return t;
     }
 
-    const maxPixelRatio = () => Math.min(window.devicePixelRatio || 1, mobile ? 1.5 : 1.75);
+    const maxPixelRatio = () => Math.min(window.devicePixelRatio || 1, 2);
 
     function initRenderer() {
       renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true, powerPreference: 'high-performance' });
@@ -545,10 +572,11 @@
       const uniforms = {
         uMask: { value: modelMasks[index] },
         uTint: { value: new THREE.Color(ITEMS[index].c[0][1]) },
+        uBaseLuma: { value: modelLumas[index] },
         uReveal: { value: 0 }
       };
       const material = new THREE.MeshBasicMaterial({
-        map: modelTextures[index], transparent: true, depthWrite: false,
+        map: modelTextures[index], transparent: true, depthWrite: false, toneMapped: false,
         side: THREE.DoubleSide, opacity: reveal ? 1 : 0
       });
       material.userData.uniforms = uniforms;
@@ -556,20 +584,17 @@
       material.onBeforeCompile = shader => {
         shader.uniforms.uMask = uniforms.uMask;
         shader.uniforms.uTint = uniforms.uTint;
-        const extraUniforms = reveal
-          ? '\nuniform sampler2D uMask;\nuniform vec3 uTint;\nuniform float uReveal;'
-          : '\nuniform sampler2D uMask;\nuniform vec3 uTint;';
-        if (reveal) shader.uniforms.uReveal = uniforms.uReveal;
+        shader.uniforms.uBaseLuma = uniforms.uBaseLuma;
+        shader.uniforms.uReveal = uniforms.uReveal;
+        const discardCondition = reveal ? 'vMapUv.y < (1.0 - uReveal)' : 'vMapUv.y >= (1.0 - uReveal)';
         shader.fragmentShader = shader.fragmentShader
-          .replace('#include <common>', '#include <common>' + extraUniforms)
+          .replace('#include <common>', '#include <common>\nuniform sampler2D uMask;\nuniform vec3 uTint;\nuniform float uBaseLuma;\nuniform float uReveal;')
           .replace('#include <map_fragment>', `#include <map_fragment>
-            float garmentMask = texture2D(uMask, vMapUv).r;
+            float garmentMask = smoothstep(0.18, 0.62, texture2D(uMask, vMapUv).r);
             float garmentLuma = dot(diffuseColor.rgb, vec3(0.299, 0.587, 0.114));
-            vec3 garmentTint = uTint * (0.55 + 0.7 * garmentLuma);
-            diffuseColor.rgb = mix(diffuseColor.rgb, garmentTint, garmentMask);`);
-        if (reveal) {
-          shader.fragmentShader = shader.fragmentShader.replace('void main() {', 'void main() {\n  if (vMapUv.y < (1.0 - uReveal)) discard;');
-        }
+            float garmentShade = clamp(garmentLuma / uBaseLuma, 0.0, 1.0 / max(max(uTint.r, max(uTint.g, uTint.b)), 0.05));
+            diffuseColor.rgb = mix(diffuseColor.rgb, uTint * garmentShade, garmentMask);`)
+          .replace('void main() {', `void main() {\n  if (${discardCondition}) discard;`);
       };
       return material;
     }
@@ -577,6 +602,7 @@
     function setModelTexture(mesh, index) {
       mesh.material.map = modelTextures[index];
       mesh.material.userData.uniforms.uMask.value = modelMasks[index];
+      mesh.material.userData.uniforms.uBaseLuma.value = modelLumas[index];
     }
 
     function buildModel() {
@@ -607,10 +633,10 @@
       const bgMat = new THREE.MeshPhysicalMaterial({ color: 0xe9e4dc, roughness: .24, metalness: .08, transparent: true, opacity: .66, side: THREE.DoubleSide, depthWrite: false });
       const bg = new THREE.Mesh(bgGeo, bgMat); bg.position.z = 0; group.add(bg);
 
-      const garmentMat = new THREE.MeshBasicMaterial({ map: garmentTextures[index % 5], transparent: true, depthWrite: false, side: THREE.DoubleSide });
+      const garmentMat = new THREE.MeshBasicMaterial({ map: garmentTextures[index % 5], transparent: true, depthWrite: false, toneMapped: false, side: THREE.DoubleSide });
       const garment = new THREE.Mesh(new THREE.PlaneGeometry(.78, .92), garmentMat); garment.position.set(0, .17, .018); group.add(garment);
 
-      const labelMat = new THREE.MeshBasicMaterial({ map: labelTex, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+      const labelMat = new THREE.MeshBasicMaterial({ map: labelTex, transparent: true, depthWrite: false, toneMapped: false, side: THREE.DoubleSide });
       const label = new THREE.Mesh(new THREE.PlaneGeometry(.86, .20), labelMat); label.position.set(0, -.52, .024); group.add(label);
 
       const sheenMat = new THREE.MeshBasicMaterial({ map: sheenTex, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending });
@@ -793,16 +819,30 @@
       setTint(ITEMS[selectedIndex].c[index][1]);
     });
 
+    function finishScan() {
+      if (!scanState) return;
+      const modelUniforms = modelMesh.material.userData.uniforms;
+      setModelTexture(modelMesh, scanState.itemIndex);
+      modelUniforms.uReveal.value = 0;
+      modelUniforms.uTint.value.copy(tintCurrent);
+      modelMesh.material.opacity = 1;
+      nextModelMesh.visible = false; gridMesh.visible = false; scanMesh.visible = false;
+      scanState = null;
+    }
+
     function startTryOn(index) {
       const itemIndex = mod(index, 5);
       setSelected(itemIndex, true);
       if (reducedMotion) {
         setModelTexture(modelMesh, itemIndex);
+        tintCurrent.copy(tintTarget);
         modelMesh.material.opacity = 1;
         nextModelMesh.visible = false; gridMesh.visible = false; scanMesh.visible = false;
         return;
       }
-      if (scanState) scanState = null;
+      finishScan();
+      modelMesh.material.userData.uniforms.uTint.value.copy(tintCurrent);
+      tintCurrent.copy(tintTarget);
       setModelTexture(nextModelMesh, itemIndex);
       nextModelMesh.material.userData.uniforms.uReveal.value = 0;
       nextModelMesh.visible = true;
@@ -817,18 +857,14 @@
       // cubic-bezier(.65,0,.35,1) approximation
       const eased = p < .5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
       nextModelMesh.material.userData.uniforms.uReveal.value = eased;
+      modelMesh.material.userData.uniforms.uReveal.value = eased;
       gridMesh.material.uniforms.uReveal.value = eased;
       const top = scanMesh.userData.modelTop;
       const h = scanMesh.userData.modelHeight;
       scanMesh.position.y = top - eased * h;
       const fade = p < .08 ? p / .08 : p > .92 ? (1 - p) / .08 : 1;
       scanMesh.material.opacity = clamp(fade, 0, 1);
-      if (p >= 1) {
-        setModelTexture(modelMesh, scanState.itemIndex);
-        modelMesh.material.opacity = 1;
-        nextModelMesh.visible = false; gridMesh.visible = false; scanMesh.visible = false;
-        scanState = null;
-      }
+      if (p >= 1) finishScan();
     }
 
     function maybeSettle() {
@@ -911,7 +947,7 @@
     function updateTint(dt) {
       if (!tintCurrent || !modelMesh) return;
       tintCurrent.lerp(tintTarget, 1 - Math.exp(-dt * 12));
-      modelMesh.material.userData.uniforms.uTint.value.copy(tintCurrent);
+      if (!scanState) modelMesh.material.userData.uniforms.uTint.value.copy(tintCurrent);
       if (nextModelMesh.visible) nextModelMesh.material.userData.uniforms.uTint.value.copy(tintCurrent);
     }
 
@@ -975,9 +1011,11 @@
         const sy = (garmentImage.height - cropW) * item.g[1] / 100;
         garmentTextures.push(textureFromCanvas(cropCanvas(garmentImage, sx, sy, cropW, cropW)));
         const mx = (modelImage.width - modelW) * item.m / 100;
-        const modelCanvas = cropCanvas(modelImage, mx, modelImage.height - modelH, modelW, modelH, 512, true);
+        const modelCanvas = cropCanvas(modelImage, mx, modelImage.height - modelH, modelW, modelH, modelW, modelH, true);
+        const mask = buildMaskTexture(modelCanvas, item);
         modelTextures.push(textureFromCanvas(modelCanvas));
-        modelMasks.push(buildMaskTexture(modelCanvas, item));
+        modelMasks.push(mask.texture);
+        modelLumas.push(mask.meanLuma);
       });
       garmentImage = modelImage = null;
 
